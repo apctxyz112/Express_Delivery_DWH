@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  postgres-db:
+    image: postgres:15
+    container_name: express_postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=airflow_meta
+    ports:
+      - "5444:5432"
+    volumes:
+      - pg_dwh_data:/var/lib/postgresql/data
+    command: >
+      bash -c "
+      docker-entrypoint.sh postgres &
+      sleep 5;
+      psql -U postgres -tc \"SELECT 1 FROM pg_database WHERE datname = 'express_oltp'\" | grep -q 1 || psql -U postgres -c 'CREATE DATABASE express_oltp';
+      psql -U postgres -tc \"SELECT 1 FROM pg_database WHERE datname = 'express_dwh'\" | grep -q 1 || psql -U postgres -c 'CREATE DATABASE express_dwh';
+      wait
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  airflow:
+    image: apache/airflow:2.9.1-python3.11
+    container_name: express_airflow
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://postgres:postgres@postgres-db:5432/airflow_meta
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - OLTP_DB_URI=postgresql+psycopg2://postgres:postgres@postgres-db:5432/express_oltp
+      - DWH_DB_URI=postgresql+psycopg2://postgres:postgres@postgres-db:5432/express_dwh
+      - PYTHONPATH=/opt/airflow   # FIX LỖI 2: Báo cho Python biết thư mục gốc của project để import 'config'
+    volumes:
+      - ../dags:/opt/airflow/dags
+      - ../scripts:/opt/airflow/scripts
+      - ../config:/opt/airflow/config
+      - ../sql:/opt/airflow/sql
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+      pip install 'SQLAlchemy>=1.4.49,<2.0' psycopg2-binary==2.9.9 pandas==2.1.4 Faker==25.2.0 &&
+      export PYTHONPATH=/opt/airflow &&
+      airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Express --lastname Admin --role Admin --email admin@express.vn || true &&
+      python /opt/airflow/scripts/run_local_pipeline.py &&
+      (airflow webserver & airflow scheduler)
+      "
+
+volumes:
+  pg_dwh_data:

@@ -1,0 +1,51 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+ENV/
+
+# ===== Environment / Secrets =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ===== Airflow =====
+airflow.cfg
+airflow.db
+logs/
+webserver_config.py
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ===== Logs =====
+*.log
+
+# ===== Database dumps / local data =====
+*.sql.gz
+*.dump
+*.bak
+data/
+tmp/
+pgdata/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
