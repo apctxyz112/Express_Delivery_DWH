@@ -874,15 +874,23 @@ def run_extract_load_snowflake(batch_id: str):
                        )
                 """, (batch_id, table))
 
-                if row_count > 0:
+                  if row_count > 0:
                     df["batch_id"] = batch_id
                     df["extracted_at"] = pd.Timestamp(snapshot_ts)
                     df.columns = [c.upper() for c in df.columns]
 
-                    # Chuyển mọi cột datetime (ns/us/ms/tz) sang chuỗi ISO chuẩn và giữ NULL (None) cho NaT
-                    for col in df.select_dtypes(include=["datetime", "datetimetz"]).columns:
-                        formatted = df[col].dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-                        df[col] = formatted.where(df[col].notna(), None)
+                    # 1. Xử lý riêng các cột kiểu DATE thuần túy (ví dụ: EFFECTIVE_DATE)
+                    # Chuẩn hóa mọi cột DATE / TIMESTAMP sang chuỗi ISO để Snowflake tự cast chuẩn xác 100%
+                    for col in df.columns:
+                        if col == "EFFECTIVE_DATE":
+                            df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d")
+                        elif (
+                            pd.api.types.is_datetime64_any_dtype(df[col])
+                            or col.endswith("_DATE")
+                            or "TIME" in col
+                            or col.endswith("_AT")
+                        ):
+                            df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S.%f")
 
                     write_pandas(
                         conn=sf_conn,
@@ -1040,7 +1048,7 @@ def run_dq_gate_snowflake(batch_id: str):
             SELECT
                 %s, 'shipments', TO_VARCHAR(s.SHIPMENT_ID),
                 'RULE_MISSING_SHIPMENT_FK', 'Warning',
-                'Thiếu người nhận/hub đi/hub đến/dịch vụ/phương thức thanh toán -> Sẽ map vào dòng Unknown (SK = -1)',
+                'Thiếu người nhận/hub đi/hub đến/dịch vụ/phương thức thanh toán -> exẽ map vào dòng Unknown (SK = -1)',
                 OBJECT_CONSTRUCT(s.*)
             FROM STG.SHIPMENTS s
             WHERE s.BATCH_ID = %s

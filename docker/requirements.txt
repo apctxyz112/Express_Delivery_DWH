@@ -1,7 +1,12 @@
+# Bắt buộc SQLAlchemy < 2.0 cho nhân Airflow 2.9
 SQLAlchemy>=1.4.49,<2.0
-psycopg2-binary==2.9.9
-pandas==2.1.4
-Faker==25.2.0
-snowflake-connector-python[pandas]==3.12.2
-dbt-core==1.8.7
-dbt-snowflake==1.8.4
+psycopg2-binary>=2.9.9
+
+# Tương thích với airflow-providers-snowflake / google
+pandas>=2.1.2,<2.2.0
+Faker>=25.2.0
+
+# Snowflake Connector & dbt
+snowflake-connector-python[pandas]>=3.12.0,<4.0.0
+dbt-core>=1.8.7,<1.9.0
+dbt-snowflake>=1.8.4,<1.9.0

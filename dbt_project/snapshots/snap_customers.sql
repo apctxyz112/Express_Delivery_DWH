@@ -6,6 +6,7 @@
         unique_key='customer_id',
         strategy='check',
         check_cols=['row_hash'],
+        updated_at='updated_at',
         invalidate_hard_deletes=True
     )
 }}

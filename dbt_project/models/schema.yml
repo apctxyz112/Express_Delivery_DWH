@@ -15,12 +15,19 @@ models:
       - name: weight
         tests:
           - dbt_utils.expression_is_true:
-              arguments:
-                expression: "> 0"
+              expression: "> 0"
       - name: current_status
         tests:
           - accepted_values:
-              values: ['CREATED', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERING', 'DELIVERY_FAILED', 'DELIVERED', 'RETURNED', 'CANCELLED']
+              values:
+                - 'CREATED'
+                - 'PICKED_UP'
+                - 'IN_TRANSIT'
+                - 'DELIVERING'
+                - 'DELIVERY_FAILED'
+                - 'DELIVERED'
+                - 'RETURNED'
+                - 'CANCELLED'
 
   - name: dim_customer
     columns:

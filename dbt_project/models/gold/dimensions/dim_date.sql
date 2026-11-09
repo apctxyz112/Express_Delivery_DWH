@@ -1,5 +1,6 @@
 WITH date_spine AS (
-    SELECT DATEADD('day', SEQ4(), '2024-01-01'::DATE) AS full_date
+    SELECT 
+        DATEADD('day', (ROW_NUMBER() OVER (ORDER BY NULL) - 1), '2024-01-01'::DATE) AS full_date
     FROM TABLE(GENERATOR(ROWCOUNT => 3650))
 )
 SELECT

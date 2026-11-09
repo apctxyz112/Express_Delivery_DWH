@@ -88,35 +88,39 @@ with DAG(
 
     dbt_run_silver = BashOperator(
         task_id="dbt_run_silver",
-        bash_command=(
-            f"dbt run --project-dir {DBT_PROJECT_DIR} --profiles-dir {DBT_PROJECT_DIR} "
-            "--select silver --vars '{\"batch_id\": \"{{ ti.xcom_pull(task_ids=\"extract_postgres_to_snowflake_stg\", key=\"batch_id\") }}\"}'"
-        ),
+        bash_command="""
+            BATCH_ID="{{ ti.xcom_pull(task_ids='extract_postgres_to_snowflake_stg', key='batch_id') }}"
+            dbt run --project-dir /opt/airflow/dbt_project --profiles-dir /opt/airflow/dbt_project \
+                    --select silver --vars "{\"batch_id\": \"$BATCH_ID\"}"
+        """,
     )
 
     dbt_snapshot = BashOperator(
         task_id="dbt_snapshot_scd2",
-        bash_command=(
-            f"dbt snapshot --project-dir {DBT_PROJECT_DIR} --profiles-dir {DBT_PROJECT_DIR} "
-            "--vars '{\"batch_id\": \"{{ ti.xcom_pull(task_ids=\"extract_postgres_to_snowflake_stg\", key=\"batch_id\") }}\"}'"
-        ),
+        bash_command="""
+            BATCH_ID="{{ ti.xcom_pull(task_ids='extract_postgres_to_snowflake_stg', key='batch_id') }}"
+            dbt snapshot --project-dir /opt/airflow/dbt_project --profiles-dir /opt/airflow/dbt_project \
+                        --vars "{\"batch_id\": \"$BATCH_ID\"}"
+        """,
     )
 
     dbt_run_gold = BashOperator(
         task_id="dbt_run_gold_marts",
-        bash_command=(
-            f"dbt run --project-dir {DBT_PROJECT_DIR} --profiles-dir {DBT_PROJECT_DIR} "
-            "--select gold.dimensions gold.facts gold.analytics "
-            "--vars '{\"batch_id\": \"{{ ti.xcom_pull(task_ids=\"extract_postgres_to_snowflake_stg\", key=\"batch_id\") }}\"}'"
-        ),
+        bash_command="""
+            BATCH_ID="{{ ti.xcom_pull(task_ids='extract_postgres_to_snowflake_stg', key='batch_id') }}"
+            dbt run --project-dir /opt/airflow/dbt_project --profiles-dir /opt/airflow/dbt_project \
+                    --select gold.dimensions gold.facts gold.analytics \
+                    --vars "{\"batch_id\": \"$BATCH_ID\"}"
+        """,
     )
 
     dbt_test_marts = BashOperator(
         task_id="dbt_test_marts",
-        bash_command=(
-            f"dbt test --project-dir {DBT_PROJECT_DIR} --profiles-dir {DBT_PROJECT_DIR} "
-            "--vars '{\"batch_id\": \"{{ ti.xcom_pull(task_ids=\"extract_postgres_to_snowflake_stg\", key=\"batch_id\") }}\"}'"
-        ),
+        bash_command="""
+            BATCH_ID="{{ ti.xcom_pull(task_ids='extract_postgres_to_snowflake_stg', key='batch_id') }}"
+            dbt test --project-dir /opt/airflow/dbt_project --profiles-dir /opt/airflow/dbt_project \
+                    --vars "{\"batch_id\": \"$BATCH_ID\"}"
+        """,
     )
 
     finalize_watermark = PythonOperator(

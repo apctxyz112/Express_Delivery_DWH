@@ -25,8 +25,8 @@ def run_extract_load_snowflake(batch_id: str):
         sf_cur.execute("""
             SELECT BATCH_ID FROM META.ETL_BATCH_LOG
             WHERE BATCH_ID <> %s
-              AND STATUS IN ('RUNNING', 'EXTRACTED')
-              AND RUN_START > DATEADD('hour', -6, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
+                AND STATUS IN ('RUNNING', 'EXTRACTED')
+                AND RUN_START > DATEADD('hour', -6, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
             ORDER BY RUN_START DESC
             LIMIT 1
         """, (batch_id,))
@@ -72,12 +72,15 @@ def run_extract_load_snowflake(batch_id: str):
                 sf_cur.execute(f"""
                     DELETE FROM STG.{table.upper()}
                     WHERE BATCH_ID = %s
-                       OR BATCH_ID IN (
-                            SELECT BATCH_ID FROM META.ETL_BATCH_LOG
-                            WHERE TABLE_NAME = %s AND STATUS = 'SUCCESS'
-                            ORDER BY RUN_START DESC
-                            OFFSET {STG_RETENTION_BATCHES}
-                       )
+                        OR BATCH_ID IN (
+                            WITH ranked_batches AS (
+                                SELECT BATCH_ID,
+                                        ROW_NUMBER() OVER (ORDER BY RUN_START DESC) AS rn
+                                FROM META.ETL_BATCH_LOG
+                                WHERE TABLE_NAME = %s AND STATUS = 'SUCCESS'
+                            )
+                            SELECT BATCH_ID FROM ranked_batches WHERE rn > {STG_RETENTION_BATCHES}
+                        )
                 """, (batch_id, table))
 
                 if row_count > 0:
@@ -85,10 +88,18 @@ def run_extract_load_snowflake(batch_id: str):
                     df["extracted_at"] = pd.Timestamp(snapshot_ts)
                     df.columns = [c.upper() for c in df.columns]
 
-                    # Chuyển mọi cột datetime (ns/us/ms/tz) sang chuỗi ISO chuẩn và giữ NULL (None) cho NaT
-                    for col in df.select_dtypes(include=["datetime", "datetimetz"]).columns:
-                        formatted = df[col].dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-                        df[col] = formatted.where(df[col].notna(), None)
+                    # 1. Xử lý riêng các cột kiểu DATE thuần túy (ví dụ: EFFECTIVE_DATE)
+                    # Chuẩn hóa mọi cột DATE / TIMESTAMP sang chuỗi ISO để Snowflake tự cast chuẩn xác 100%
+                    for col in df.columns:
+                        if col == "EFFECTIVE_DATE":
+                            df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d")
+                        elif (
+                            pd.api.types.is_datetime64_any_dtype(df[col])
+                            or col.endswith("_DATE")
+                            or "TIME" in col
+                            or col.endswith("_AT")
+                        ):
+                            df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S.%f")
 
                     write_pandas(
                         conn=sf_conn,
@@ -98,7 +109,6 @@ def run_extract_load_snowflake(batch_id: str):
                         auto_create_table=False,
                         quote_identifiers=False,
                     )
-
                 sf_cur.execute("""
                     UPDATE META.ETL_BATCH_LOG
                     SET ROWS_EXTRACTED = %s,

@@ -1,301 +1,348 @@
-# 🚚 Express Delivery Data Warehouse (PostgreSQL OLTP $\rightarrow$ Snowflake + dbt + Airflow)
 
-Dự án xây dựng Kho dữ liệu (Data Warehouse) theo kiến trúc **Modern Data Stack (ELT)** kết hợp **Medallion Architecture (`STG` $\rightarrow$ `SILVER` $\rightarrow$ `GOLD`)** và **Kimball Dimensional Modeling (Star Schema + SCD Type 2)** cho bài toán Giao hàng Nhanh (Express Delivery).
+# Express Delivery DWH: Kiến Trúc Lai (Hybrid Modern ELT)
 
----
+**Local Orchestration (Docker, PostgreSQL 15, Apache Airflow, dbt Core) $\longleftrightarrow$ Cloud Data Warehouse (Snowflake)**[cite: 1, 2]
 
-## 📐 Kiến trúc Tổng quan
-
-1. **Source OLTP (`PostgreSQL 15`)**: Giả lập hệ thống giao dịch thực tế gồm 11 bảng nghiệp vụ (Vận đơn, Sự kiện hành trình, Khách hàng, Bưu tá, Bưu cục, Phương tiện, Đối soát COD, Khiếu nại...).
-2. **Extract & Load (`Python + Snowflake Connector`)**: Đọc dữ liệu gia tăng (Incremental Extract) theo cơ chế Watermark kết hợp cửa sổ lùi (`Lookback Window 10 phút`) trong một Snapshot `REPEATABLE READ` đồng nhất và đẩy thẳng lên tầng `STG` của Snowflake.
-3. **Data Quality Gate (`META.DATA_QUARANTINE`)**: Chặn lọc tự động 11 quy tắc chất lượng dữ liệu:
-   - **Blocker**: Cách ly hoàn toàn các bản ghi vi phạm nghiêm trọng (trọng lượng $\le 0$, ngày giao trước ngày đặt, thiếu trường bắt buộc...) không cho vào `SILVER`.
-   - **Warning**: Ghi nhận cảnh báo và tự động xử lý làm sạch hoặc ánh xạ về khóa ngoại mặc định (`Unknown SK = -1`).
-4. **Transformation (`dbt Core + dbt-snowflake`)**:
-   - **Tầng `SILVER`**: Làm sạch, chuẩn hóa định dạng, khử trùng lặp (`QUALIFY ROW_NUMBER() = 1`) và hợp nhất (`MERGE`).
-   - **Snapshots (`SCD Type 2`)**: Theo dõi lịch sử thay đổi hạng thành viên khách hàng (`snap_customers`) và lịch sử điều chuyển bưu cục/hợp đồng của bưu tá (`snap_couriers`).
-   - **Tầng `GOLD`**: Xây dựng 8 bảng Dimension, 3 bảng Fact (Transaction, Accumulating Snapshot, Periodic Daily Snapshot) và 3 bảng/view Semantic phục vụ BI.
-5. **Orchestration (`Apache Airflow 2.9`)**: Tự động hóa toàn bộ quy trình theo lịch định kỳ.
+Dự án xây dựng hệ thống Kho dữ liệu (Data Warehouse) theo kiến trúc **Medallion (STG $\rightarrow$ SILVER $\rightarrow$ GOLD)** kết hợp mô hình chiều **Kimball Star Schema** và lịch sử thay đổi **SCD Type 2** cho bài toán Giao nhận Chuyển phát nhanh (Express Delivery)[cite: 1, 2].
 
 ---
 
-## 🛠️ BƯỚC 1: Đăng ký tài khoản Snowflake & Lấy thông tin kết nối
+## 1. Tổng Quan Kiến Trúc Lai (Hybrid Architecture)
 
-Nếu bạn chưa có tài khoản Snowflake, bạn có thể đăng ký gói dùng thử miễn phí **30 ngày ($400 credit)** không cần thẻ tín dụng:
+Hệ thống phân tách rõ ràng giữa tầng điều phối cục bộ và tầng tính toán đám mây theo mô hình **Hybrid Modern ELT**[cite: 2]:
 
-### 1.1. Đăng ký tài khoản
+```text
+[ LOCAL MACHINE / DOCKER ]                                     [ CLOUD (AWS / AZURE / GCP) ]
+┌─────────────────────────┐                                   ┌──────────────────────────────────┐
+│  PostgreSQL 15 (OLTP)   │                                   │       Snowflake Data Cloud       │
+│  - Chứa DB nghiệp vụ    │                                   │                                  │
+│  - Sinh dữ liệu giao dịch│                                  │  ┌────────────┐   ┌───────────┐  │
+└────────────┬────────────┘                                   │  │ STG (Raw)  │──>│  SILVER   │  │
+             │                                                │  └────────────┘   └─────┬─────┘  │
+             ▼ (read_sql / write_pandas qua Internet)         │                         │        │
+┌─────────────────────────┐                                   │                         ▼        │
+│ Apache Airflow (Docker) │ ──[ Bắn lệnh dbt biên dịch ]────> │  ┌────────────┐   ┌───────────┐  │
+│  - Điều phối lịch trình │                                   │  │ GOLD (Mart)│<──│ SCD2 Snap │  │
+│  - Python EL & DQ Gate  │                                   │  └────────────┘   └───────────┘  │
+│  - dbt-core CLI runner  │                                   │  ┌───────────────────────────┐   │
+└─────────────────────────┘                                   │  │ META (Watermark, Quarant) │   │
+                                                              │  └───────────────────────────┘   │
+                                                              │   (100% Compute & Storage Cloud) │
+                                                              └──────────────────────────────────┘
+```
 
-1. Truy cập trang đăng ký: [https://signup.snowflake.com/](https://signup.snowflake.com/)
-2. Điền thông tin cá nhân (Họ tên, Email, Công ty/Trường học, Quốc gia: **Vietnam**).
-3. Ở bước chọn phiên bản:
-   - **Snowflake Edition**: Chọn **Enterprise** (để hỗ trợ đầy đủ tính năng nâng cao).
-   - **Cloud Provider**: Chọn **AWS (Amazon Web Services)**.
-   - **Region**: Chọn **Asia Pacific (Singapore - ap-southeast-1)** để có tốc độ kết nối nhanh nhất từ Việt Nam.
-4. Nhấn **Get Started**. Mở hộp thư Email của bạn, tìm email kích hoạt từ Snowflake và nhấn **Click to Activate**.
-5. Đặt **Username** (ví dụ: `express_admin`) và **Password** đăng nhập.
+### Phân định trách nhiệm tài nguyên:
 
-### 1.2. Cách lấy đúng mã `SNOWFLAKE_ACCOUNT` (Cực kỳ quan trọng)
-
-Sau khi đăng nhập vào giao diện Snowflake (Snowsight):
-
-1. Nhìn xuống **góc dưới cùng bên trái** màn hình, bấm vào tên tài khoản của bạn.
-2. Di chuột vào mục **Account** $\rightarrow$ bấm vào biểu tượng **Copy account identifier** (hoặc **View account details**).
-3. Chuyển dấu chấm (`.`) giữa tên Organization và tên Account thành dấu gạch ngang (`-`), hoặc dùng mã `locator.region.cloud`:
-   - **Cách 1 (Khuyên dùng - `<orgname>-<account_name>`)**: Ví dụ nếu bạn copy được `ABCD123.XY98765`, hãy đổi thành `ABCD123-XY98765`.
-   - **Cách 2 (Theo URL trình duyệt)**: Nếu URL đăng nhập của bạn là `https://xy12345.ap-southeast-1.aws.snowflakecomputing.com`, thì `SNOWFLAKE_ACCOUNT` của bạn chính là **`xy12345.ap-southeast-1.aws`**.
-
-> 💡 **Lưu ý về quyền (Role)**: Tài khoản vừa tạo mặc định có quyền `ACCOUNTADMIN`. Hệ thống sẽ dùng quyền này để tự động tạo Warehouse `EXPRESS_WH` và Database `EXPRESS_DWH`.
+* **Tại máy cục bộ (Local Container via Docker)**[cite: 2]:
+  * Lưu trữ cơ sở dữ liệu giao dịch nguồn `express_oltp` (PostgreSQL 15) gồm 11 bảng nghiệp vụ[cite: 1, 2].
+  * Vận hành Apache Airflow (`Scheduler`, `Webserver`, `airflow_meta` DB) để lập lịch và điều phối pipeline[cite: 1, 2].
+  * Thực thi `dbt-core` và `dbt-snowflake` với vai trò **client**: biên dịch mã SQL/Jinja và đẩy truy vấn qua API lên Snowflake (máy local không tốn RAM/CPU để xử lý biến đổi dữ liệu lớn)[cite: 2].
+* **Tại hạ tầng đám mây (Snowflake Data Cloud)**[cite: 2]:
+  * Lưu trữ 100% dữ liệu qua 4 Schemas: `STG` (Bronze/Raw), `SILVER` (Cleaned & Deduplicated + SCD2 Snapshots), `GOLD` (8 Dimensions, 3 Facts, 3 Views/MVs) và `META` (Watermark, Batch Audit Log, Data Quarantine)[cite: 1, 2].
+  * Thực thi 100% tính toán (Joins, Deduplication, SCD Type 2 Point-in-Time, Aggregations) bằng Virtual Warehouse `EXPRESS_WH`[cite: 1, 2].
 
 ---
 
-## 📂 BƯỚC 2: Chuẩn bị Cấu trúc Thư mục Dự án
-
-Đảm bảo bạn đã lưu đầy đủ các file từ tài liệu thiết kế vào đúng cấu trúc thư mục sau:
+## 2. Cấu Trúc Thư Mục Dự Án
 
 ```text
 express-delivery-dwh/
+├── .env                                    # Biến môi trường kết nối Postgres & Snowflake
 ├── config/
-│   ├── db_config.py
-│   └── settings.py
+│   ├── db_config.py                        # Quản lý kết nối SQLAlchemy (OLTP) & Snowflake Connector
+│   └── settings.py                         # Đọc cấu hình môi trường & quy mô sinh dữ liệu
 ├── sql/
 │   ├── oltp/
-│   │   ├── 01_create_oltp_tables.sql
-│   │   └── 02_seed_constraints.sql
+│   │   ├── 01_create_oltp_tables.sql       # DDL 11 bảng nguồn PostgreSQL OLTP
+│   │   └── 02_seed_constraints.sql         # Index tối ưu truy vấn incremental theo updated_at
 │   └── snowflake_init/
-│       └── 01_init_snowflake.sql
+│       └── 01_init_snowflake.sql           # DDL khởi tạo Warehouse, DB, 4 Schemas, bảng META/STG & UDF
 ├── scripts/
-│   ├── generate_oltp_data.py
-│   ├── extract_load_snowflake.py
-│   ├── dq_gate_snowflake.py
-│   ├── post_load_watermark.py
-│   └── run_local_pipeline.py
+│   ├── generate_oltp_data.py               # Sinh dữ liệu lần đầu (10,000 đơn) & mô phỏng Incremental + SCD2
+│   ├── extract_load_snowflake.py           # Incremental Extract (REPEATABLE READ + Lookback 10p) -> Snowflake STG
+│   ├── dq_gate_snowflake.py                # 11 quy tắc Data Quality Gate (Blocker & Warning) -> DATA_QUARANTINE
+│   ├── post_load_watermark.py              # Cập nhật Watermark từ SOURCE_SNAPSHOT_TS & đóng Batch Log
+│   └── run_local_pipeline.py               # Script chạy toàn bộ pipeline End-to-End
 ├── dbt_project/
-│   ├── dbt_project.yml
-│   ├── packages.yml
-│   ├── profiles.yml
+│   ├── dbt_project.yml                     # Cấu hình dbt models theo các tầng Silver & Gold
+│   ├── packages.yml                        # Khai báo package dbt_utils
+│   ├── profiles.yml                        # Cấu hình kết nối tới Snowflake
 │   ├── macros/
-│   │   └── generate_schema_name.sql
+│   │   └── generate_schema_name.sql        # Macro giữ nguyên tên Schema chuẩn (SILVER, GOLD)
 │   ├── snapshots/
-│   │   ├── snap_customers.sql
-│   │   └── snap_couriers.sql
+│   │   ├── snap_customers.sql              # Theo dõi lịch sử SCD Type 2 cho Khách hàng
+│   │   └── snap_couriers.sql               # Theo dõi lịch sử SCD Type 2 cho Bưu tá
 │   └── models/
-│       ├── sources.yml
-│       ├── schema.yml
-│       ├── silver/        (11 file .sql)
+│       ├── sources.yml                     # Khai báo nguồn STG & META trên Snowflake
+│       ├── schema.yml                      # Data tests kiểm tra PK, FK, accepted_values
+│       ├── silver/                         # 11 bảng Silver (lọc Blocker, khử trùng lặp QUALIFY ROW_NUMBER)
 │       └── gold/
-│           ├── dimensions/ (8 file .sql)
-│           ├── facts/      (3 file .sql)
-│           └── analytics/  (3 file .sql)
+│           ├── dimensions/                 # 8 bảng chiều (dim_date, dim_hub, dim_customer, dim_courier,...)
+│           ├── facts/                      # 3 bảng sự kiện (fact_shipment_lifecycle, fact_tracking_events, fact_daily_hub_snapshot)
+│           └── analytics/                  # 3 bảng/view báo cáo (v_slaship_summary, mv_daily_hub_performance, mv_courier_performance)
 ├── dags/
-│   └── express_delivery_snowflake_dbt_dag.py
+│   └── express_delivery_snowflake_dbt_dag.py # Airflow DAG điều phối tự động mỗi 4 giờ
 └── docker/
-    ├── docker-compose.yml
-    ├── init-db.sql
-    └── requirements.txt
+    ├── docker-compose.yml                  # Định nghĩa container postgres-oltp & airflow
+    ├── init-db.sql                         # Khởi tạo database express_oltp khi dựng container
+    └── requirements.txt                    # Danh sách thư viện Python, Snowflake Connector & dbt
 ```
 
 ---
 
-## ⚙️ BƯỚC 3: Cấu hình Biến Môi trường (`.env`)
+## 3. Bước 1: Chuẩn Bị Hạ Tầng Đám Mây (Snowflake Setup)
 
-Tạo một file có tên `.env` nằm bên trong thư mục **`docker/.env`** (cùng cấp với file `docker-compose.yml`) với nội dung sau:
+### 1.1. Đăng ký tài khoản Snowflake Free Trial
+
+1. Truy cập [signup.snowflake.com](https://signup.snowflake.com/)[cite: 2].
+2. Đăng ký gói **Enterprise Edition**, chọn Cloud Provider bất kỳ (khuyên dùng **AWS**), Region gần nhất (ví dụ: `ap-southeast-1` Singapore)[cite: 2].
+3. Thiết lập **Username** và **Password** (lưu lại để cấu hình vào file `.env`)[cite: 2].
+
+### 1.2. Lấy thông tin `SNOWFLAKE_ACCOUNT` (Account Identifier)
+
+1. Trong giao diện Snowsight, bấm vào tên Profile ở góc dưới cùng bên trái $\rightarrow$ **Account** $\rightarrow$ di chuột vào biểu tượng Account[cite: 2].
+2. Bấm **Copy Account Identifier** (hoặc Copy URL)[cite: 2].
+3. Chuẩn hóa định dạng `SNOWFLAKE_ACCOUNT`[cite: 2]:
+   * Nếu URL là `https://xy12345.ap-southeast-1.snowflakecomputing.com` $\rightarrow$ giá trị là `xy12345.ap-southeast-1`[cite: 2].
+   * Nếu URL theo định dạng tổ chức `https://org-account.snowflakecomputing.com` $\rightarrow$ giá trị là `org-account` (ví dụ: `KCXSMSY-TH54040`)[cite: 2].
+   * **Lưu ý:** Tuyệt đối không lấy tiền tố `https://` và hậu tố `.snowflakecomputing.com`[cite: 2].
+
+### 1.3. Khởi tạo Cơ sở dữ liệu & Schemas trên Snowflake (Bắt buộc)
+
+Trước khi kết nối từ máy local hoặc chạy Docker, bạn **phải khởi tạo sẵn Warehouse, Database `EXPRESS_DWH` và các bảng nền trên Snowflake**[cite: 1, 2]:
+
+1. Đăng nhập vào [Snowflake Web Console](https://app.snowflake.com/), vào mục **Projects** $\rightarrow$ **Worksheets** $\rightarrow$ tạo một **SQL Worksheet** mới[cite: 2].
+2. Mở file `sql/snowflake_init/01_init_snowflake.sql` trong thư mục dự án, sao chép toàn bộ nội dung và dán vào Worksheet trên Snowflake[cite: 1, 2].
+3. Chọn **Select All** (Ctrl + A) và bấm **Run** (Ctrl + Enter) để tạo:
+   * Virtual Warehouse: `EXPRESS_WH` (`XSMALL`, tự động ngủ sau 60s)[cite: 1].
+   * Database: `EXPRESS_DWH` cùng 4 Schemas: `STG`, `SILVER`, `GOLD`, `META`[cite: 1].
+   * 3 bảng quản trị ở tầng `META`: `ETL_WATERMARK`, `ETL_BATCH_LOG`, `DATA_QUARANTINE`[cite: 1].
+   * 11 bảng thô ở tầng `STG` và hàm tiện ích `GOLD.FN_DATE_KEY`[cite: 1].
+
+---
+
+## 4. Bước 2: Cấu Hình Biến Môi Trường (`.env`)
+
+Tại thư mục gốc của dự án (`express-delivery-dwh/`), tạo file `.env` với nội dung sau[cite: 2]:
 
 ```ini
-# Thông tin tài khoản Snowflake của bạn (Lấy ở Bước 1)
-SNOWFLAKE_ACCOUNT= abc12345.ap-southeast-1.aws
-SNOWFLAKE_USER=express_admin
-SNOWFLAKE_PASSWORD=MatKhauSnowflakeCuaBan123!
+# ==============================================================================
+# 1. KẾT NỐI LOCAL POSTGRESQL (CONTAINER NGUỒN OLTP)
+# ==============================================================================
+# Lưu ý:
+# - Khi chạy bằng Docker Compose: dùng host 'postgres-oltp'
+# - Khi chạy script Python ngoài máy thật (host): đổi 'postgres-oltp' thành 'localhost'
+OLTP_DB_URI=postgresql+psycopg2://postgres:postgres@postgres-oltp:5432/express_oltp
+
+# ==============================================================================
+# 2. KẾT NỐI CLOUD SNOWFLAKE (DATA WAREHOUSE)
+# ==============================================================================
+SNOWFLAKE_ACCOUNT=KCXSMSY-TH54040
+SNOWFLAKE_USER=PHONGNHDATA25
+SNOWFLAKE_PASSWORD=Your_Strong_Password_Here
 SNOWFLAKE_ROLE=ACCOUNTADMIN
 SNOWFLAKE_WAREHOUSE=EXPRESS_WH
 SNOWFLAKE_DATABASE=EXPRESS_DWH
 ```
 
-*(Thay thế `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, và `SNOWFLAKE_PASSWORD` bằng thông tin thực tế của bạn).*
-
 ---
 
-## 🚀 BƯỚC 4: Khởi chạy Hệ thống (Chọn 1 trong 2 cách)
+## 5. Bước 3: Thiết Lập Môi Trường Cục Bộ (Windows 64-bit) & Kiểm Tra Kết Nối
 
-Bạn có thể chạy toàn bộ hệ thống tự động hoàn toàn qua **Docker Compose** (Cách 1 - Khuyên dùng) hoặc chạy trực tiếp bằng **Python trên máy cá nhân** kết hợp container PostgreSQL (Cách 2 - Thuận tiện khi cần debug từng câu lệnh dbt).
+*(Bước này giúp cài đặt môi trường Python ảo trên máy thật để kiểm tra kết nối `dbt debug` tới Snowflake hoặc chạy script trực tiếp ngoài Docker)*[cite: 2].
 
----
+### 3.1. Kiểm tra phiên bản Python 64-bit
 
-### CÁCH 1: Chạy trọn gói bằng Docker Compose (PostgreSQL + Airflow + dbt)
+Mở PowerShell và chạy lệnh[cite: 2]:
 
-**Yêu cầu:** Máy tính đã cài đặt và bật sẵn **Docker Desktop**.
-
-#### 1. Khởi động các container
-
-Mở Terminal / PowerShell, di chuyển vào thư mục `docker/` và chạy lệnh:
-
-```bash
-cd express-delivery-dwh/docker
-docker compose up -d
+```powershell
+python -c "import struct; print(struct.calcsize('P') * 8)"
 ```
 
-#### 2. Theo dõi tiến trình khởi tạo tự động (Batch 1 - Full Load)
+Kết quả phải trả về `64`[cite: 2]. Nếu trả về `32`, hãy gỡ và cài đặt lại Python 64-bit từ trang chủ Python[cite: 2].
 
-Ngay khi container `express_airflow` khởi động, nó sẽ tự động cài đặt các thư viện, tạo bảng OLTP, sinh **10.000 vận đơn mẫu**, tạo Warehouse/Database trên Snowflake và chạy trọn vẹn **Batch 1 (Full Load)**. Bạn có thể xem trực tiếp log bằng lệnh:
+### 3.2. Tạo môi trường ảo (`venv`) và cài đặt thư viện
 
-```bash
-docker logs -f express_airflow
-```
+```powershell
+# 1. Di chuyển vào thư mục gốc của dự án
+cd express-delivery-dwh
 
-Đợi khoảng 2–3 phút cho đến khi màn hình xuất hiện thông báo:
+# 2. Tạo virtual environment
+python -m venv venv
 
-```text
-🎉 SNOWFLAKE + DBT PIPELINE HOÀN TẤT THÀNH CÔNG!
-   • GOLD.FACT_SHIPMENT_LIFECYCLE : 9,960 dòng
-   • GOLD.FACT_TRACKING_EVENTS    : 41,800+ dòng
-   • GOLD.FACT_DAILY_HUB_SNAPSHOT : 840+ dòng
-   • META.DATA_QUARANTINE         : 190+ bản ghi lỗi/cảnh báo đã bắt được
-```
+# 3. Kích hoạt virtual environment
+# (Nếu gặp lỗi ExecutionPolicy, chạy: Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process)
+.\venv\Scripts\Activate.ps1
 
-#### 3. Truy cập giao diện Apache Airflow & Chạy Batch 2 (Incremental + SCD2)
-
-1. Mở trình duyệt truy cập: [http://localhost:8080](http://localhost:8080)
-2. Đăng nhập với tài khoản:
-
-   - **Username**: `admin`
-   - **Password**: `admin`
-3. Để mô phỏng phát sinh dữ liệu mới ở OLTP (thêm **200 vận đơn mới** + đổi hạng thành viên của 15 khách hàng + điều chuyển bưu cục của 10 bưu tá để kiểm thử **SCD Type 2**), bạn có thể chạy lệnh sau trong Terminal:
-
-   ```bash
-   docker exec -it express_airflow python /opt/airflow/scripts/run_local_pipeline.py
-   ```
-
-   Hoặc chỉ sinh dữ liệu mới ở OLTP rồi bấm nút **Trigger DAG (`▶️`)** trên giao diện Airflow cho DAG `express_delivery_snowflake_elt`:
-   ```bash
-   # Chỉ sinh thêm dữ liệu Incremental ở Postgres OLTP
-   docker exec -it express_airflow python -c "from scripts.generate_oltp_data import generate_data; generate_data()"
-   ```
-
-   Sau đó vào Airflow Web UI $\rightarrow$ Bật công tắc DAG `express_delivery_snowflake_elt` sang **ON** $\rightarrow$ Nhấn nút **Play (`▶️`)** để xem từng task chạy xanh lần lượt từ `preflight_checks` $\rightarrow$ `dbt_test_marts` $\rightarrow$ `update_watermark_and_audit_log`.
-
----
-
-### CÁCH 2: Chạy trực tiếp trên máy Local (Dành cho Developer muốn chạy lẻ từng bước)
-
-Nếu bạn muốn chạy trực tiếp lệnh `python` và `dbt` trên máy tính (không cần bật Airflow):
-
-#### 1. Chỉ bật PostgreSQL OLTP bằng Docker
-
-```bash
-cd express-delivery-dwh/docker
-docker compose up -d postgres-oltp
-```
-
-#### 2. Tạo môi trường ảo Python & Cài đặt thư viện
-
-Quay về thư mục gốc của dự án (`express-delivery-dwh/`):
-
-```bash
-cd ..
-python -m venv .venv
-
-# Kích hoạt môi trường ảo:
-# - Trên Windows (PowerShell):
-.venv\Scripts\Activate.ps1
-# - Trên macOS / Linux:
-source .venv/bin/activate
-
-# Cài đặt thư viện
+# 4. Nâng cấp pip và cài đặt đầy đủ thư viện
+python -m pip install --upgrade pip setuptools wheel
 pip install -r docker/requirements.txt
 ```
 
-#### 3. Nạp biến môi trường trên Terminal
+### 3.3. Nạp biến môi trường vào PowerShell, tải dbt packages và chạy `dbt debug`
 
-- **Trên Windows (PowerShell)**:
-  ```powershell
-  $env:OLTP_DB_URI="postgresql+psycopg2://postgres:postgres@localhost:5432/express_oltp"
-  $env:SNOWFLAKE_ACCOUNT="abc12345.ap-southeast-1.aws"
-  $env:SNOWFLAKE_USER="express_admin"
-  $env:SNOWFLAKE_PASSWORD="MatKhauSnowflakeCuaBan123!"
-  $env:SNOWFLAKE_ROLE="ACCOUNTADMIN"
-  $env:SNOWFLAKE_WAREHOUSE="EXPRESS_WH"
-  $env:SNOWFLAKE_DATABASE="EXPRESS_DWH"
-  ```
-- **Trên macOS / Linux (Bash/Zsh)**:
-  ```bash
-  export OLTP_DB_URI="postgresql+psycopg2://postgres:postgres@localhost:5432/express_oltp"
-  export SNOWFLAKE_ACCOUNT="abc12345.ap-southeast-1.aws"
-  export SNOWFLAKE_USER="express_admin"
-  export SNOWFLAKE_PASSWORD="MatKhauSnowflakeCuaBan123!"
-  export SNOWFLAKE_ROLE="ACCOUNTADMIN"
-  export SNOWFLAKE_WAREHOUSE="EXPRESS_WH"
-  export SNOWFLAKE_DATABASE="EXPRESS_DWH"
-  ```
+```powershell
+# 1. Nạp các biến từ file .env vào phiên PowerShell hiện tại
+Get-Content .env | Where-Object { $_ -match '^[^#].*=.*' } | ForEach-Object {
+    $parts = $_ -split '=', 2
+    [System.Environment]::SetEnvironmentVariable($parts[0].Trim(), $parts[1].Trim(), "Process")
+}
 
-#### 4. Chạy Pipeline Lần 1 (Khởi tạo DDL + Seed 10.000 đơn + Full Load)
+# 2. Di chuyển vào thư mục dbt_project
+cd dbt_project
 
-```bash
-python scripts/run_local_pipeline.py
+# 3. Tải package dbt-labs/dbt_utils
+dbt deps --profiles-dir .
+
+# 4. Kiểm tra kết nối từ dbt tới Snowflake Cloud
+dbt debug --profiles-dir .
 ```
 
-#### 5. Chạy Pipeline Lần 2 (Mô phỏng Incremental + Cập nhật SCD Type 2)
+Nếu màn hình hiển thị thông báo[cite: 2]:
 
-Chạy lại đúng câu lệnh trên một lần nữa:
-
-```bash
-python scripts/run_local_pipeline.py
+```text
+All checks passed!
+Connection test: [OK connection ok]
 ```
 
-Ở lần chạy thứ 2, script sẽ phát hiện bảng `shipments` đã có dữ liệu và tự động chuyển sang chế độ **Incremental Batch**:
+![Kết quả dbt deps và dbt debug](image/worklog/1794218352950.png)
+![Chi tiết dbt debug thành công](image/worklog/1794218362622.png)
 
-- Cập nhật hạng thẻ của 15 khách hàng và điều chuyển bưu cục của 10 bưu tá.
-- Sinh thêm 200 vận đơn mới.
-- Chỉ trích xuất các bản ghi thay đổi sau mốc Watermark và tạo phiên bản lịch sử mới (`SCD Type 2`) trong `GOLD.DIM_CUSTOMER` và `GOLD.DIM_COURIER`.
+Nghĩa là `dbt-core` đã nhận diện thành công `profiles.yml` và kết nối thông suốt tới Database `EXPRESS_DWH` trên Snowflake[cite: 1, 2]. Quay lại thư mục gốc để chuẩn bị khởi chạy hệ thống[cite: 2]:
+
+```powershell
+cd ..
+```
 
 ---
 
-## 🔍 BƯỚC 5: Kiểm tra & Đối soát kết quả trên Snowflake (Snowsight)
+## 6. Bước 4: Khởi Động Và Vận Hành Hệ Thống
 
-Đăng nhập vào giao diện Snowflake, mở một **SQL Worksheet** mới và chạy các câu truy vấn dưới đây để kiểm nghiệm toàn bộ kiến trúc:
+Bạn có thể lựa chọn **1 trong 2 cách** dưới đây để vận hành pipeline[cite: 2]:
 
-### 5.1. Kiểm tra lịch sử chạy Batch & Watermark (`META`)
+### Cách 1: Khởi chạy toàn bộ bằng Docker Compose (Khuyên dùng)
+
+Docker Compose sẽ tự động dựng container PostgreSQL OLTP (`express_postgres_oltp`), Apache Airflow (`express_airflow`), cài đặt các thư viện cần thiết, khởi tạo bảng OLTP, sinh dữ liệu mẫu và kích hoạt toàn bộ pipeline lần đầu tiên[cite: 1, 2].
+
+```powershell
+# 1. Đảm bảo đã tạo Database EXPRESS_DWH trên Snowflake (ở Bước 1.3)
+# 2. Khởi động cụm dịch vụ dưới nền
+docker compose -f docker/docker-compose.yml --env-file .env up -d
+
+# 3. Theo dõi trực tiếp tiến trình chạy pipeline khởi tạo trong container Airflow
+docker logs -f express_airflow
+```
+
+![Logs chạy thành công trên Docker](image/worklog/1794218770967.png)
+
+Khi quá trình khởi tạo hoàn tất, bạn sẽ thấy thông báo trên màn hình log[cite: 1, 2]:
+
+```text
+===========================================================================
+🎉 SNOWFLAKE + DBT PIPELINE HOÀN TẤT THÀNH CÔNG!
+   • GOLD.FACT_SHIPMENT_LIFECYCLE : ... dòng
+   • GOLD.FACT_TRACKING_EVENTS    : ... dòng
+   • GOLD.FACT_DAILY_HUB_SNAPSHOT : ... dòng
+   • META.DATA_QUARANTINE         : ... bản ghi lỗi/cảnh báo đã bắt được
+===========================================================================
+```
+
+#### Quản lý & Lập lịch qua giao diện Airflow Web UI:
+
+1. Mở trình duyệt truy cập: [http://localhost:8080](http://localhost:8080)[cite: 2]
+2. Đăng nhập với tài khoản mặc định[cite: 1, 2]:
+   * **Username**: `admin`[cite: 1, 2]
+   * **Password**: `admin`[cite: 1, 2]
+3. Tìm DAG có tên: `express_delivery_snowflake_elt`[cite: 1, 2].
+4. Gạt công tắc **Unpause** sang màu xanh để Airflow tự động lập lịch chạy định kỳ mỗi 4 giờ (`0 */4 * * *`), hoặc bấm nút **Trigger DAG** (biểu tượng Play) để chạy thủ công[cite: 1, 2].
+
+---
+
+### Cách 2: Chạy trực tiếp bằng Python Script ngoài máy thật (Local Host)
+
+Nếu chỉ muốn dựng container PostgreSQL làm nguồn OLTP và chạy trực tiếp script điều phối từ PowerShell trên máy thật[cite: 2]:
+
+```powershell
+# 1. Chỉ khởi động container PostgreSQL OLTP
+docker compose -f docker/docker-compose.yml up -d postgres-oltp
+
+# 2. Chuyển OLTP_DB_URI sang localhost cho phiên PowerShell hiện tại
+$env:OLTP_DB_URI="postgresql+psycopg2://postgres:postgres@localhost:5432/express_oltp"
+
+# 3. Chạy toàn bộ pipeline (Lần 1: Full Seed 10,000 vận đơn -> Lần 2+: Incremental Batch 200 vận đơn + SCD2)
+python scripts/run_local_pipeline.py
+```
+
+---
+
+## 7. Bước 5: Luồng Xử Lý Chi Tiết Của Pipeline (7 Giai Đoạn)
+
+Mỗi khi `run_local_pipeline.py` hoặc Airflow DAG `express_delivery_snowflake_elt` được kích hoạt, hệ thống thực thi tuần tự 7 bước nghiêm ngặt[cite: 1]:
+
+1. **Khởi tạo & Sinh dữ liệu OLTP (`generate_oltp_data.py`)**:
+   * **Lần chạy đầu tiên**: Tạo 1,500 khách hàng, 30 bưu cục (Hubs), 80 phương tiện, 200 bưu tá, 10,000 vận đơn cùng chuỗi sự kiện hành trình, thu hộ COD và khiếu nại (cố tình cài插 một số bản ghi lỗi `weight <= 0` và số điện thoại sai định dạng để kiểm thử Data Quality Gate)[cite: 1].
+   * **Các lần chạy tiếp theo (Incremental)**: Tự động sinh thêm 200 vận đơn mới và cập nhật hạng thành viên của 15 khách hàng + đổi Hub/loại hợp đồng của 10 bưu tá để mô phỏng biến động **SCD Type 2**[cite: 1].
+2. **Incremental Extract & Load (`extract_load_snowflake.py`)**:
+   * Kiểm tra chống chạy chồng batch (`RUNNING`/`EXTRACTED` trong vòng 6 giờ)[cite: 1].
+   * Mở transaction `REPEATABLE READ` đồng nhất cho cả 11 bảng trên PostgreSQL, kết hợp cửa sổ lùi 10 phút (`EXTRACT_LOOKBACK_MINUTES = 10`) dựa trên `META.ETL_WATERMARK` để không bỏ sót giao dịch commit muộn[cite: 1].
+   * Nạp thẳng dữ liệu vào tầng `STG` trên Snowflake qua `write_pandas` và chỉ giữ lại tối đa 3 batch thành công gần nhất[cite: 1].
+3. **Data Quality Gate & Quarantine (`dq_gate_snowflake.py`)**:
+   * Quét 11 quy tắc chất lượng dữ liệu ngay trên tầng `STG`[cite: 1].
+   * Cách ly toàn bộ bản ghi vi phạm lỗi nghiêm trọng (**Blocker**: `weight <= 0`, ngày giao thực tế nhỏ hơn ngày đặt, thiếu trường bắt buộc, timestamp ở tương lai...) và ghi nhận các cảnh báo (**Warning**: thiếu khóa ngoại phụ, số điện thoại sai định dạng, bản ghi con mồ côi) vào bảng `META.DATA_QUARANTINE` kèm bản sao JSON (`OBJECT_CONSTRUCT`)[cite: 1].
+4. **Biến đổi Tầng Silver (`dbt run --select silver`)**:
+   * Khử trùng lặp bằng `QUALIFY ROW_NUMBER() OVER (PARTITION BY <pk> ORDER BY updated_at DESC) = 1`[cite: 1].
+   * Loại bỏ triệt để các bản ghi bị đánh dấu `Blocker` trong `META.DATA_QUARANTINE`, chuẩn hóa chuỗi ký tự, làm sạch số điện thoại và tính toán `row_hash` MD5[cite: 1].
+5. **Ghi nhận Lịch sử SCD Type 2 (`dbt snapshot`)**:
+   * Chạy `snap_customers` và `snap_couriers` theo chiến lược `check` trên cột `row_hash` từ tầng Silver để tự động đóng phiên bản cũ (`dbt_valid_to`) và mở phiên bản mới khi có thay đổi[cite: 1].
+6. **Xây dựng Tầng Gold & Kiểm thử (`dbt run --select gold...` & `dbt test`)**:
+   * Cập nhật 8 bảng **Dimensions** (đảm bảo mọi bảng đều có dòng `Unknown SK = -1` và tính khoảng hiệu lực `[valid_from, valid_to)` liền kề không khe hở)[cite: 1].
+   * Nạp Incremental Merge cho 3 bảng **Facts** (`fact_shipment_lifecycle`, `fact_tracking_events`, `fact_daily_hub_snapshot`) với kỹ thuật Point-in-Time Join chính xác vào phiên bản SCD2 tại thời điểm phát sinh giao dịch[cite: 1].
+   * Làm mới 3 Views/Tables phân tích (`v_slaship_summary`, `mv_daily_hub_performance`, `mv_courier_performance`) và chạy `dbt test` kiểm tra ràng buộc khóa[cite: 1].
+7. **Cập nhật Watermark & Đóng Batch (`post_load_watermark.py`)**:
+   * Chỉ khi tất cả các bước trên thành công 100%, hệ thống mới cập nhật `LAST_EXTRACTED_TIMESTAMP = SOURCE_SNAPSHOT_TS` vào `META.ETL_WATERMARK` và chuyển trạng thái batch sang `SUCCESS`[cite: 1].
+
+---
+
+## 8. Bước 6: Kiểm Tra & Đối Soát Dữ Liệu Trên Snowflake
+
+Mở **Snowflake Web Console** $\rightarrow$ **Worksheets**, chọn Database `EXPRESS_DWH` và chạy bộ truy vấn dưới đây để kiểm chứng toàn bộ kiến trúc[cite: 1, 2]:
+
+### 6.1. Thống kê số lượng bản ghi qua các tầng Medallion & Báo cáo nghiệp vụ
+
+```sql
+USE ROLE ACCOUNTADMIN;
+USE WAREHOUSE EXPRESS_WH;
+USE DATABASE EXPRESS_DWH;
+
+-- 1. Thống kê bản ghi qua từng tầng kiến trúc Medallion
+SELECT '1. STG (Raw Load)' AS LAYER, COUNT(*) AS TOTAL_RECORDS FROM STG.SHIPMENTS
+UNION ALL
+SELECT '2. SILVER (Cleaned & Validated)', COUNT(*) FROM SILVER.SILVER_SHIPMENTS
+UNION ALL
+SELECT '3. GOLD (Fact Lifecycle Mart)', COUNT(*) FROM GOLD.FACT_SHIPMENT_LIFECYCLE
+UNION ALL
+SELECT '4. QUARANTINE (Lỗi Blocker bị cách ly)', COUNT(*) FROM META.DATA_QUARANTINE WHERE SEVERITY = 'Blocker';
+
+-- 2. Báo cáo SLA giao hàng thực tế theo từng Bưu cục (Hub) xuất phát
+SELECT 
+    h.HUB_NAME,
+    COUNT(f.SHIPMENT_SK) AS TOTAL_ORDERS,
+    COUNT_IF(f.IS_ON_TIME) AS ON_TIME_ORDERS,
+    COUNT_IF(f.IS_SLA_BREACHED) AS BREACHED_ORDERS,
+    ROUND(100.0 * COUNT_IF(f.IS_ON_TIME) / NULLIF(COUNT_IF(f.IS_DELIVERED), 0), 2) AS OTD_PERCENTAGE
+FROM GOLD.FACT_SHIPMENT_LIFECYCLE f
+JOIN GOLD.DIM_HUB h ON f.ORIGIN_HUB_SK = h.HUB_SK
+WHERE f.IS_DELIVERED = TRUE
+GROUP BY h.HUB_NAME
+ORDER BY TOTAL_ORDERS DESC;
+```
+
+### 6.2. Bộ 4 truy vấn kiểm toán tính toàn vẹn dữ liệu (Data Audit Queries)
 
 ```sql
 USE DATABASE EXPRESS_DWH;
 
--- 1. Xem mốc Watermark hiện tại của 11 bảng
-SELECT * FROM META.ETL_WATERMARK ORDER BY TABLE_NAME;
-
--- 2. Xem nhật ký từng Batch (số dòng trích xuất, bị từ chối Blocker và nạp thành công)
-SELECT BATCH_ID, TABLE_NAME, ROWS_EXTRACTED, ROWS_REJECTED, ROWS_LOADED, STATUS, SOURCE_SNAPSHOT_TS
-FROM META.ETL_BATCH_LOG
-ORDER BY RUN_START DESC, TABLE_NAME;
-
--- 3. Xem thống kê các lỗi dữ liệu bị bắt giữ tại chốt chặn Data Quality Gate
-SELECT RULE_NAME, SEVERITY, SOURCE_TABLE, COUNT(*) AS TOTAL_RECORDS
-FROM META.DATA_QUARANTINE
-GROUP BY RULE_NAME, SEVERITY, SOURCE_TABLE
-ORDER BY SEVERITY, TOTAL_RECORDS DESC;
-```
-
-### 5.2. Kiểm tra lịch sử biến đổi SCD Type 2 (Sau khi chạy từ 2 Batch trở lên)
-
-```sql
--- Xem các khách hàng có nhiều hơn 1 phiên bản lịch sử (đổi hạng thành viên)
-SELECT CUSTOMER_SK, CUSTOMER_NK, CUSTOMER_NAME, MEMBERSHIP_TIER, VALID_FROM, VALID_TO, IS_CURRENT
-FROM GOLD.DIM_CUSTOMER
-WHERE CUSTOMER_NK IN (
-    SELECT CUSTOMER_NK FROM GOLD.DIM_CUSTOMER GROUP BY CUSTOMER_NK HAVING COUNT(*) > 1
-)
-ORDER BY CUSTOMER_NK, VALID_FROM;
-
--- Xem các bưu tá được điều chuyển bưu cục hoặc thay đổi loại hợp đồng
-SELECT COURIER_SK, COURIER_NK, COURIER_NAME, ASSIGNED_HUB_CODE, CONTRACT_TYPE, VALID_FROM, VALID_TO, IS_CURRENT
-FROM GOLD.DIM_COURIER
-WHERE COURIER_NK IN (
-    SELECT COURIER_NK FROM GOLD.DIM_COURIER GROUP BY COURIER_NK HAVING COUNT(*) > 1
-)
-ORDER BY COURIER_NK, VALID_FROM;
-```
-
-### 5.3. Bốn câu truy vấn Đối soát Chất lượng (Audit Queries)
-
-```sql
--- 1. Kiểm tra không có bản ghi "mất im lặng" giữa STG và SILVER (Kỳ vọng = 0)
+-- Audit 1: Đảm bảo không có bản ghi "mất im lặng" giữa STG và SILVER (Kỳ vọng = 0)
 SELECT COUNT(*) AS MAT_IM_LANG
 FROM STG.SHIPMENT_TRACKING_EVENTS e
 WHERE NOT EXISTS (SELECT 1 FROM SILVER.SILVER_SHIPMENT_TRACKING_EVENTS s WHERE s.EVENT_ID = e.EVENT_ID)
@@ -306,7 +353,7 @@ WHERE NOT EXISTS (SELECT 1 FROM SILVER.SILVER_SHIPMENT_TRACKING_EVENTS s WHERE s
         AND q.RECORD_ID = TO_VARCHAR(e.EVENT_ID)
   );
 
--- 2. Trạng thái hiện tại trên Fact khớp 100% với cờ nghiệp vụ (Kỳ vọng = 0)
+-- Audit 2: Trạng thái hiện tại trên Fact khớp 100% với cờ nghiệp vụ (Kỳ vọng = 0)
 SELECT COUNT(*) AS LECH_TRANG_THAI
 FROM GOLD.FACT_SHIPMENT_LIFECYCLE f
 JOIN GOLD.DIM_STATUS_REASON sr ON sr.STATUS_REASON_SK = f.CURRENT_STATUS_SK
@@ -314,69 +361,42 @@ WHERE (f.IS_DELIVERED AND sr.STATUS_CODE <> 'DELIVERED')
    OR (f.IS_RETURNED  AND sr.STATUS_CODE <> 'RETURNED')
    OR (f.IS_CANCELLED AND sr.STATUS_CODE <> 'CANCELLED');
 
--- 3. Mọi Fact trỏ đúng phiên bản SCD2 bao trùm thời điểm phát sinh (Kỳ vọng = 0, 0)
+-- Audit 3: Mọi Fact trỏ đúng phiên bản SCD2 bao trùm thời điểm phát sinh (Kỳ vọng = 0, 0)
 SELECT
     (SELECT COUNT(*) FROM GOLD.FACT_TRACKING_EVENTS e
      JOIN GOLD.DIM_COURIER c ON c.COURIER_SK = e.COURIER_SK
-     WHERE NOT (e.EVENT_TIMESTAMP >= c.VALID_FROM AND e.EVENT_TIMESTAMP < c.VALID_TO)) AS SU_KIEN_SAI_PHIEN_BAN,
+     WHERE NOT (e.EVENT_TIMESTAMP >= c.VALID_FROM AND e.EVENT_TIMESTAMP < c.VALID_TO)) AS SU_KIEN_SAI_PHIEN_BAN_SCD2,
     (SELECT COUNT(*) FROM GOLD.FACT_SHIPMENT_LIFECYCLE f
      JOIN GOLD.DIM_CUSTOMER c ON c.CUSTOMER_SK IN (f.SENDER_CUSTOMER_SK, f.RECEIVER_CUSTOMER_SK)
-     WHERE NOT (f.ORDER_TIMESTAMP >= c.VALID_FROM AND f.ORDER_TIMESTAMP < c.VALID_TO)) AS VAN_DON_SAI_PHIEN_BAN;
+     WHERE NOT (f.ORDER_TIMESTAMP >= c.VALID_FROM AND f.ORDER_TIMESTAMP < c.VALID_TO)) AS VAN_DON_SAI_PHIEN_BAN_SCD2;
 
--- 4. Đơn đã giao: đúng hạn + trễ hạn = tổng đã giao (Kỳ vọng 2 cột bằng nhau)
+-- Audit 4: Đơn đã giao: Đúng hạn + Trễ hạn = Tổng đơn đã giao (Kỳ vọng 2 cột bằng nhau)
 SELECT
     COUNT_IF(IS_DELIVERED) AS DELIVERED,
     COUNT_IF(IS_ON_TIME) + COUNT_IF(IS_SLA_BREACHED) AS ON_TIME_PLUS_BREACHED
 FROM GOLD.FACT_SHIPMENT_LIFECYCLE;
 ```
 
-### 5.4. Truy vấn Báo cáo Phân tích (Tầng Semantic / Analytics)
-
-```sql
--- 1. Báo cáo tỷ lệ giao hàng đúng hạn (OTD %) và doanh thu theo loại dịch vụ
-SELECT
-    SERVICE_NAME,
-    SUM(TOTAL_SHIPMENTS) AS TOTAL_ORDERS,
-    SUM(DELIVERED_SHIPMENTS) AS DELIVERED_ORDERS,
-    ROUND(100.0 * SUM(ON_TIME_SHIPMENTS) / NULLIF(SUM(DELIVERED_SHIPMENTS), 0), 2) AS OTD_PCT,
-    SUM(TOTAL_FREIGHT_REVENUE) AS TOTAL_REVENUE
-FROM GOLD.V_SLASHIP_SUMMARY
-GROUP BY SERVICE_NAME
-ORDER BY TOTAL_ORDERS DESC;
-
--- 2. Hiệu suất vận hành & tỷ lệ tồn kho của các Bưu cục (Hub Performance)
-SELECT * FROM GOLD.MV_DAILY_HUB_PERFORMANCE
-ORDER BY SNAPSHOT_DATE DESC, BACKLOG_CAPACITY_RATIO_PCT DESC
-LIMIT 20;
-
--- 3. Hiệu suất giao hàng của Bưu tá theo từng phiên bản lịch sử công tác (Courier SCD2)
-SELECT * FROM GOLD.MV_COURIER_PERFORMANCE
-ORDER BY YEAR DESC, MONTH DESC, DELIVERED_SHIPMENTS DESC
-LIMIT 20;
-```
-
 ---
 
-## 🛠️ BƯỚC 6: Xử lý Sự cố Thường gặp (Troubleshooting)
+## 9. Các Lệnh Quản Trị & Xử Lý Sự Cố Thường Dùng
 
-1. **Lỗi `250001 (08001): Failed to connect to DB: ... incorrect username or password` hoặc `404 Not Found`:**
-   - Nguyên nhân: Sai định dạng `SNOWFLAKE_ACCOUNT`.
-   - Cách khắc phục: Không bao gồm `https://` hoặc `.snowflakecomputing.com` trong `SNOWFLAKE_ACCOUNT`. Chỉ điền `<org_name>-<account_name>` (ví dụ: `ABCD123-XY98765`) hoặc `<locator>.<region>.<cloud>` (ví dụ: `xy98765.ap-southeast-1.aws`).
-2. **Lỗi `Batch BATCH_XXXXX đang chạy dở`:**
-   - Nguyên nhân: Lần chạy trước bị ngắt đột ngột (ví dụ tắt nóng cửa sổ Terminal) khi trạng thái trong `META.ETL_BATCH_LOG` vẫn đang là `RUNNING` hoặc `EXTRACTED`.
-   - Cách khắc phục: Mở Snowflake Worksheet và chạy lệnh sau để đóng batch bị treo:
-     ```sql
-     UPDATE EXPRESS_DWH.META.ETL_BATCH_LOG
-     SET STATUS = 'FAILED', RUN_END = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
-     WHERE STATUS IN ('RUNNING', 'EXTRACTED');
-     ```
-3. **Muốn xóa sạch toàn bộ dữ liệu để chạy lại từ đầu (Reset 100%):**
-   - Trên Snowflake Worksheet:
-     ```sql
-     DROP DATABASE IF EXISTS EXPRESS_DWH;
-     ```
-   - Dưới thư mục `docker/`:
-     ```bash
-     docker compose down -v
-     docker compose up -d
-     ```
+| Thao tác                                                             | Câu lệnh Terminal / PowerShell                                                                                      |
+| :-------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------- |
+| **Khởi động toàn bộ hệ thống Docker**                    | `docker compose -f docker/docker-compose.yml --env-file .env up -d`[cite: 2]                                        |
+| **Xem logs trực tiếp của container Airflow**                 | `docker logs -f express_airflow`[cite: 2]                                                                           |
+| **Chạy thêm 1 batch Incremental + SCD2 ngay trong container** | `docker exec -it express_airflow python /opt/airflow/scripts/run_local_pipeline.py`[cite: 1, 2]                     |
+| **Chạy riêng `dbt test` kiểm tra chất lượng dữ liệu** | `docker exec -it express_airflow bash -c "cd /opt/airflow/dbt_project && dbt test --profiles-dir ."`[cite: 1, 2]    |
+| **Chạy `dbt compile` để xem mã SQL Snowflake thực tế**  | `docker exec -it express_airflow bash -c "cd /opt/airflow/dbt_project && dbt compile --profiles-dir ."`[cite: 1, 2] |
+| **Dừng hệ thống container (giữ lại dữ liệu OLTP)**       | `docker compose -f docker/docker-compose.yml down`[cite: 2]                                                         |
+| **Xóa sạch container & volume để làm lại từ đầu**      | `docker compose -f docker/docker-compose.yml down -v`[cite: 2]                                                      |
+
+### Xử lý sự cố thường gặp (Troubleshooting):
+
+* **Lỗi `Database 'EXPRESS_DWH' does not exist` khi mới bật Docker**: Do bạn chưa chạy script khởi tạo DDL trên Snowflake. Hãy thực hiện **Bước 1.3** (copy nội dung `sql/snowflake_init/01_init_snowflake.sql` chạy trên Snowflake Worksheet), sau đó chạy lại `docker restart express_airflow`[cite: 1, 2].
+* **Lỗi `Batch ... đang chạy dở` (`[AUDIT-A5]`)**: Nếu một lần chạy trước bị ngắt đột ngột mà chưa kịp cập nhật trạng thái `FAILED`, hãy vào Snowflake chạy câu lệnh sau để mở khóa[cite: 1]:
+  ```sql
+  UPDATE EXPRESS_DWH.META.ETL_BATCH_LOG
+  SET STATUS = 'FAILED', RUN_END = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  WHERE STATUS IN ('RUNNING', 'EXTRACTED');
+  ```
