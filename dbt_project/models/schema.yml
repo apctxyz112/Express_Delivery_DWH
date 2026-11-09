@@ -1,0 +1,66 @@
+version: 2
+
+models:
+  - name: silver_shipments
+    description: "Bảng vận đơn tầng Silver (đã lọc sạch mọi dòng Blocker vào META.DATA_QUARANTINE)"
+    columns:
+      - name: shipment_id
+        tests:
+          - not_null
+          - unique
+      - name: shipment_number
+        tests:
+          - not_null
+          - unique
+      - name: weight
+        tests:
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: "> 0"
+      - name: current_status
+        tests:
+          - accepted_values:
+              values: ['CREATED', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERING', 'DELIVERY_FAILED', 'DELIVERED', 'RETURNED', 'CANCELLED']
+
+  - name: dim_customer
+    columns:
+      - name: customer_sk
+        tests:
+          - not_null
+          - unique
+
+  - name: dim_courier
+    columns:
+      - name: courier_sk
+        tests:
+          - not_null
+          - unique
+
+  - name: fact_shipment_lifecycle
+    columns:
+      - name: shipment_id_nk
+        tests:
+          - not_null
+          - unique
+      - name: sender_customer_sk
+        tests:
+          - relationships:
+              to: ref('dim_customer')
+              field: customer_sk
+      - name: origin_hub_sk
+        tests:
+          - relationships:
+              to: ref('dim_hub')
+              field: hub_sk
+
+  - name: fact_tracking_events
+    columns:
+      - name: event_id_nk
+        tests:
+          - not_null
+          - unique
+      - name: courier_sk
+        tests:
+          - relationships:
+              to: ref('dim_courier')
+              field: courier_sk

@@ -1,0 +1,29 @@
+name: 'express_delivery_dwh'
+version: '1.0.0'
+config-version: 2
+
+profile: 'express_snowflake'
+
+model-paths: ["models"]
+snapshot-paths: ["snapshots"]
+macro-paths: ["macros"]
+
+vars:
+  batch_id: "MANUAL_BATCH"
+
+models:
+  express_delivery_dwh:
+    silver:
+      +schema: SILVER
+      +materialized: incremental
+      +incremental_strategy: merge
+    gold:
+      dimensions:
+        +schema: GOLD
+        +materialized: table
+      facts:
+        +schema: GOLD
+        +materialized: incremental
+        +incremental_strategy: merge
+      analytics:
+        +schema: GOLD

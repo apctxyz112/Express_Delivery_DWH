@@ -1,0 +1,14 @@
+express_snowflake:
+  target: prod
+  outputs:
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT', 'your_account_locator') }}"
+      user: "{{ env_var('SNOWFLAKE_USER', 'your_username') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD', 'your_password') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'ACCOUNTADMIN') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'EXPRESS_DWH') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'EXPRESS_WH') }}"
+      schema: PUBLIC
+      threads: 4
+      client_session_keep_alive: False

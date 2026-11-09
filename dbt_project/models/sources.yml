@@ -1,0 +1,24 @@
+version: 2
+
+sources:
+  - name: stg
+    database: "{{ env_var('SNOWFLAKE_DATABASE', 'EXPRESS_DWH') }}"
+    schema: STG
+    tables:
+      - name: customers
+      - name: hubs
+      - name: vehicles
+      - name: couriers
+      - name: service_types
+      - name: payment_methods
+      - name: status_reasons
+      - name: shipments
+      - name: shipment_tracking_events
+      - name: cod_settlements
+      - name: customer_tickets
+
+  - name: meta
+    database: "{{ env_var('SNOWFLAKE_DATABASE', 'EXPRESS_DWH') }}"
+    schema: META
+    tables:
+      - name: data_quarantine
